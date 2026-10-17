@@ -1,5 +1,440 @@
 ---
-title: "Mini-Project Placeholder"
+title: "What We Watched: Where Netflix's Viewing Hours Go"
+format:
+  html:
+    code-fold: true
+    toc: true
+execute:
+  warning: false
 ---
 
-This is a placeholder for STA9750 Mini-Project 1. Check back soon for more!
+## Building the Viewing Record (Task 1)
+
+Netflix's [*What We Watched* reports](https://about.netflix.com/news/what-we-watched-the-first-half-of-2026) provides underlying data of Netflix's most watched shows on its platform. The report combines seven half-year reports, from 2023H1 through 2026H1, and caches the workbooks locally.
+
+```{r}
+#| message: false
+library(tidyverse)
+library(rvest)
+library(readxl)
+library(fs)
+
+load_netflix_data <- function() {
+  data_dir <- fs::path("data", "mp01")
+  fs::dir_create(data_dir)
+
+  report_urls <- c(
+    `2023H1` = "https://about.netflix.com/news/what-we-watched-a-netflix-engagement-report",
+    `2023H2` = "https://about.netflix.com/news/what-we-watched-the-second-half-of-2023",
+    `2024H1` = "https://about.netflix.com/news/what-we-watched-the-first-half-of-2024",
+    `2024H2` = "https://about.netflix.com/news/what-we-watched-the-second-half-of-2024",
+    `2025H1` = "https://about.netflix.com/news/what-we-watched-the-first-half-of-2025",
+    `2025H2` = "https://about.netflix.com/news/what-we-watched-the-second-half-of-2025",
+    `2026H1` = "https://about.netflix.com/news/what-we-watched-the-first-half-of-2026"
+  )
+
+  paths <- fs::path(data_dir, paste0(names(report_urls), ".xlsx"))
+  for (i in seq_along(paths)) {
+    if (!fs::file_exists(paths[[i]])) {
+      page <- rvest::read_html(report_urls[[i]])
+      link <- page |>
+        rvest::html_element(xpath = "//a[contains(@href, '.xlsx')]") |>
+        rvest::html_attr("href")
+      if (is.na(link)) {
+        stop("No Excel report link found for ", names(report_urls)[[i]])
+      }
+      download.file(link, paths[[i]], quiet = TRUE, mode = "wb")
+    }
+  }
+
+  purrr::map2_dfr(paths, names(report_urls), function(path, period) {
+    readxl::read_excel(path, skip = 3, na = "*") |>
+      mutate(`Release Date` = as.Date(`Release Date`), period = period)
+  }) |>
+    mutate(
+      year = stringr::str_sub(period, 1, 4),
+      half = stringr::str_sub(period, start = 6),
+      period_start = lubridate::make_date(year, if_else(half == "1", 1, 7), 1),
+      period_end = lubridate::make_date(year, if_else(half == "1", 6, 12),
+                                        if_else(half == "1", 30, 31))
+    ) |>
+    filter(!is.na(`Hours Viewed`)) |>
+    mutate(
+      live_event = !is.na(Runtime) & stringr::str_detect(Runtime, "\\d+:\\d+\\*"),
+      clean_time = stringr::str_remove(Runtime, stringr::fixed("*")),
+      Runtime = 60 * lubridate::hour(lubridate::hm(clean_time)) +
+        lubridate::minute(lubridate::hm(clean_time))
+    ) |>
+    select(-clean_time) |>
+    mutate(
+      Runtime = coalesce(Runtime, mean(Runtime, na.rm = TRUE)),
+      .by = Title,
+      Title = stringi::stri_trans_general(Title, "Latin-ASCII"),
+      Title = stringr::str_remove(Title, " // .*"),
+      Title = stringr::str_remove(Title, "[^[:ascii:]].*"),
+      Title = stringr::str_trim(Title)
+    ) |>
+    filter_out(Title == "") |>
+    select(year, period, period_start, period_end, Title, -half,
+           Runtime, Views, `Hours Viewed`, `Release Date`,
+           `Available Globally?`, live_event)
+}
+
+NETFLIX_DATA <- load_netflix_data()
+
+acquisition_check <- NETFLIX_DATA |>
+  summarise(
+    rows = n(),
+    columns = ncol(NETFLIX_DATA),
+    reporting_periods = n_distinct(period)
+  )
+acquisition_check
+```
+
+The imported table has `r scales::comma(nrow(NETFLIX_DATA))` records across `r n_distinct(NETFLIX_DATA$period)` periods. From 2023H2 onward, the starter code reads only the first, TV/shows worksheet. The movie worksheets enter the shows-versus-movies comparison later in this report; other results based on `NETFLIX_DATA` describe the imported data rather than the full Netflix catalog.
+
+## Making the Columns Usable (Tasks 2–3)
+
+The report columns are renamed to consistent lower-case names, and `year` and `available_globally` are converted to integer and logical values. The check below confirms the expected types and column names while retaining the same number of records.
+
+```{r}
+NETFLIX_DATA <- NETFLIX_DATA |>
+  rename(
+    title = Title,
+    runtime = Runtime,
+    views = Views,
+    hours_viewed = `Hours Viewed`,
+    release_date = `Release Date`,
+    available_globally = `Available Globally?`
+  ) |>
+  mutate(
+    year = as.integer(year),
+    available_globally = available_globally == "Yes"
+  )
+
+cleaning_check <- NETFLIX_DATA |>
+  summarise(
+    rows = n(),
+    tidy_column_names = all(grepl("^[a-z][a-z0-9_]*$", names(NETFLIX_DATA))),
+    year_is_integer = is.integer(year),
+    global_flag_is_logical = is.logical(available_globally),
+    missing_global_flags = sum(is.na(available_globally))
+  )
+cleaning_check
+```
+
+After changing the column names, I checked that the data types made sense. I changed `year` to a number and `available_globally` to TRUE or FALSE so I could use both columns in the analysis.
+
+## What is Present—and What is Missing? (Task 4)
+
+I first looked at the columns and their summaries to see what information was available. I also checked for missing values in each reporting period because those gaps could affect the comparisons later in the project.
+
+```{r}
+glimpse(NETFLIX_DATA)
+skimr::skim(NETFLIX_DATA)
+
+NETFLIX_DATA |>
+  summarise(
+    records = n(),
+    missing_runtime = sum(is.na(runtime)),
+    missing_views = sum(is.na(views)),
+    missing_release_date = sum(is.na(release_date)),
+    .by = period
+  ) |>
+  arrange(period) |>
+  gt::gt() |>
+  gt::tab_header(title = "Coverage of key fields by period") |>
+  gt::cols_label(period = "Period", records = "Records",
+                 missing_runtime = "Runtime missing",
+                 missing_views = "Views missing",
+                 missing_release_date = "Release date missing") |>
+  gt::fmt_number(columns = -period, decimals = 0)
+```
+
+When looking through the data, there is some missing information. The 2023H1 report has no values for `views`, and `runtime` is missing for `r scales::comma(sum(is.na(NETFLIX_DATA$runtime) & NETFLIX_DATA$period == "2023H1"))` of its `r scales::comma(sum(NETFLIX_DATA$period == "2023H1"))` records. Across all periods, `release_date` is missing for `r scales::comma(sum(is.na(NETFLIX_DATA$release_date)))` records. Hours view can still be analyzed, but I will have be careful when a question depends on one of those other columns.
+
+## Six Questions that put the Catalog in Focus (Task 5)
+
+```{r}
+date_range <- NETFLIX_DATA |>
+  summarise(first_day = min(period_start), last_day = max(period_end))
+
+distinct_titles <- NETFLIX_DATA |>
+  summarise(n_titles = n_distinct(title)) |>
+  pull(n_titles)
+
+bridgerton_hours <- NETFLIX_DATA |>
+  filter(str_detect(title, regex("^Bridgerton: Season|^Queen Charlotte: A Bridgerton Story$", ignore_case = TRUE))) |>
+  summarise(hours = sum(hours_viewed)) |>
+  pull(hours)
+
+stranger_things_hours <- NETFLIX_DATA |>
+  filter(str_detect(title, regex("Stranger Things", ignore_case = TRUE))) |>
+  filter_out(str_detect(title, regex("Beyond Stranger Things", ignore_case = TRUE))) |>
+  filter_out(str_detect(title, regex("Tales from", ignore_case = TRUE))) |>
+  filter_out(str_detect(title, regex("Fireplace", ignore_case = TRUE))) |>
+  summarise(hours = sum(hours_viewed)) |>
+  pull(hours)
+
+top_ten_2026_share <- NETFLIX_DATA |>
+  filter(period == "2026H1") |>
+  summarise(hours_viewed = sum(hours_viewed), .by = title) |>
+  arrange(desc(hours_viewed)) |>
+  summarise(share = sum(head(hours_viewed[title != "Other Shows"], 10)) /
+              sum(hours_viewed)) |>
+  pull(share)
+
+global_availability <- NETFLIX_DATA |>
+  summarise(
+    title_share = n_distinct(title[available_globally %in% TRUE]) / n_distinct(title),
+    hours_share = sum(hours_viewed[available_globally %in% TRUE]) /
+      sum(hours_viewed)
+  )
+```
+
+### 1. How Far does this Viewing History reach?
+
+The data covers viewing from `r format(date_range$first_day, "%B %Y")` through `r format(date_range$last_day, "%B %Y")`. These are reporting periods, so the hours for a title refer to a particular half-year.
+
+### 2. How many Different Titles appear?
+
+I found `r scales::comma(distinct_titles)` different title names in the imported data. Different seasons can count as separate titles.
+
+### 3. What does the Bridgerton Universe add up to?
+
+The main *Bridgerton* seasons and *Queen Charlotte: A Bridgerton Story* add up to `r scales::comma(bridgerton_hours)` hours viewed across the available periods. I left out the related afterparty and fireplace titles as they are separated from the show.
+
+### 4. How Much Time Went to Hawkins?
+
+The five main seasons of *Stranger Things* add up to `r scales::comma(stranger_things_hours)` hours viewed. I excluded *Beyond Stranger Things*, *Tales From '85*, and the fireplace title because the question asks for the five seasons.
+
+### 5. Do Ten Hits Dominate 2026H1?
+
+The top ten individual titles made up `r scales::percent(top_ten_2026_share, accuracy = 0.1)` of the imported watch hours in 2026H1. That is a small share, which means most viewing was spread across other titles. I kept *Other Shows* in the total hours but did not treat it as one individual title in the top ten.
+
+### 6. Does Global Availability align with Watch Time?
+
+Globally available titles made up `r scales::percent(global_availability$title_share, accuracy = 0.1)` of the distinct titles in the imported data but received `r scales::percent(global_availability$hours_share, accuracy = 0.1)` of its watch hours. I can see a relationship here, although the data does not show that global availability caused the difference.
+
+## Five Views of the Streaming Business (Task 6)
+
+The tables move from individual hits to catalog breadth, repeat viewing, format mix, and live programming. Hours viewed is the consistent measure across these comparisons, but it does not measure production cost, profit, or unique viewers.
+
+### The Title at the Top of each Half-Year
+
+```{r}
+period_title_hours <- NETFLIX_DATA |>
+  summarise(hours_viewed = sum(hours_viewed), .by = c(period, title))
+
+period_leaders <- period_title_hours |>
+  group_by(period) |>
+  mutate(share = hours_viewed / sum(hours_viewed)) |>
+  slice_max(hours_viewed, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(period)
+
+period_leaders |>
+  gt::gt() |>
+  gt::tab_header(title = "Top title in each half-year") |>
+  gt::cols_label(period = "Period", title = "Title",
+                 hours_viewed = "Hours viewed", share = "Share of period") |>
+  gt::fmt_number(columns = hours_viewed, decimals = 0) |>
+  gt::fmt_percent(columns = share, decimals = 2)
+```
+
+**Takeaway:** *`r period_leaders$title[period_leaders$period == "2026H1"]`* was the top title in 2026H1, with `r scales::comma(period_leaders$hours_viewed[period_leaders$period == "2026H1"])` hours viewed. It still accounted for only `r scales::percent(period_leaders$share[period_leaders$period == "2026H1"], accuracy = 0.01)` of the imported watch hours that period. One hit does not represent everything people watched.
+
+### Is a Larger Catalog Generating More Viewing Choices?
+
+```{r}
+catalog_size <- NETFLIX_DATA |>
+  summarise(
+    titles = n_distinct(title),
+    runtime_hours = sum(runtime, na.rm = TRUE) / 60,
+    runtime_coverage = mean(!is.na(runtime)),
+    .by = period
+  ) |>
+  arrange(period)
+
+catalog_size |>
+  gt::gt() |>
+  gt::tab_header(title = "Catalog size across reporting periods") |>
+  gt::cols_label(period = "Period", titles = "Titles",
+                 runtime_hours = "Known runtime (hours)",
+                 runtime_coverage = "Runtime coverage") |>
+  gt::fmt_number(columns = c(titles, runtime_hours), decimals = 0) |>
+  gt::fmt_percent(columns = runtime_coverage, decimals = 1)
+```
+
+**Takeaway:** The number of titles in the imported data increased from `r scales::comma(catalog_size$titles[catalog_size$period == "2023H2"])` in 2023H2 to `r scales::comma(catalog_size$titles[catalog_size$period == "2026H1"])` in 2026H1. The known runtime also increased from `r scales::comma(catalog_size$runtime_hours[catalog_size$period == "2023H2"], accuracy = 1)` to `r scales::comma(catalog_size$runtime_hours[catalog_size$period == "2026H1"], accuracy = 1)` hours. I would be careful comparing these figures with 2023H1 because runtime is known for only `r scales::percent(catalog_size$runtime_coverage[catalog_size$period == "2023H1"], accuracy = 0.1)` of its records, and the later import covers the shows worksheet. Despite the increases in titles and known runtime (hours), the runtime converage is relatively consistent around 98%. 
+
+### Which Titles Keep a Reliable Audience?
+
+```{r}
+staples <- NETFLIX_DATA |>
+  summarise(hours_viewed = sum(hours_viewed), .by = c(title, period)) |>
+  summarise(
+    periods = n(),
+    average_hours = mean(hours_viewed),
+    minimum_hours = min(hours_viewed),
+    sd_hours = sd(hours_viewed),
+    .by = title
+  ) |>
+  filter(periods == n_distinct(NETFLIX_DATA$period)) |>
+  arrange(desc(minimum_hours)) |>
+  slice_head(n = 10)
+
+staples |>
+  gt::gt() |>
+  gt::tab_header(title = "Titles with the strongest viewing floor",
+                 subtitle = "Present in all seven periods; ranked by minimum hours") |>
+  gt::cols_label(title = "Title", periods = "Periods",
+                 average_hours = "Average hours", minimum_hours = "Minimum hours",
+                 sd_hours = "SD of hours") |>
+  gt::fmt_number(columns = c(average_hours, minimum_hours, sd_hours),
+                 decimals = 0)
+```
+
+**Takeaway:** I looked at titles that appeared in all seven periods because one big period might not show whether people keep coming back to a title. This table ranks those titles by their lowest half-year total. *`r staples$title[1]`* had at least `r scales::comma(staples$minimum_hours[1])` hours in every period, the strongest minimum in this group.
+
+### How much Viewing goes to Shows versus Movies?
+
+```{r}
+content_mix_2023h1 <- NETFLIX_DATA |>
+  filter(period == "2023H1") |>
+  mutate(
+    content_type = case_when(
+      title == "Other Shows" ~ "Shows",
+      str_detect(title, regex("\\bSeason\\b|Limited Series|\\bPart [0-9]+\\b", ignore_case = TRUE)) ~ "Shows",
+      is.na(runtime) ~ "Unclassified",
+      runtime > 240 ~ "Shows",
+      TRUE ~ "Movies"
+    )
+  ) |>
+  summarise(hours_viewed = sum(hours_viewed), .by = c(period, content_type))
+
+# Later workbooks identify TV/shows and film/movies by worksheet. The
+# instructor's starter function reads only their first (TV/shows) worksheet.
+later_periods <- unique(NETFLIX_DATA$period[NETFLIX_DATA$period != "2023H1"])
+content_mix_later <- purrr::map_dfr(later_periods, function(current_period) {
+  path <- fs::path("data", "mp01", paste0(current_period, ".xlsx"))
+  purrr::map_dfr(readxl::excel_sheets(path), function(sheet) {
+    tibble(
+      period = current_period,
+      content_type = if_else(sheet %in% c("TV", "Shows"), "Shows", "Movies"),
+      hours_viewed = readxl::read_excel(path, sheet = sheet, skip = 3, na = "*") |>
+        summarise(hours_viewed = sum(`Hours Viewed`, na.rm = TRUE)) |>
+        pull(hours_viewed)
+    )
+  })
+})
+
+content_mix <- bind_rows(content_mix_2023h1, content_mix_later) |>
+  group_by(period) |>
+  mutate(share = hours_viewed / sum(hours_viewed)) |>
+  ungroup() |>
+  select(period, content_type, share) |>
+  pivot_wider(names_from = content_type, values_from = share, values_fill = 0) |>
+  select(period, Shows, Movies, Unclassified) |>
+  arrange(period)
+
+content_mix |>
+  gt::gt() |>
+  gt::tab_header(title = "Watch-time split by content type",
+                 subtitle = "2023H1 estimated from runtime/title; later periods use worksheet labels") |>
+  gt::cols_label(period = "Period", Shows = "Shows",
+                 Movies = "Movies",
+                 Unclassified = "Unclassified") |>
+  gt::fmt_percent(columns = c(Shows, Movies, Unclassified),
+                  decimals = 1)
+```
+
+```{r}
+content_mix |>
+  pivot_longer(-period, names_to = "content_type", values_to = "share") |>
+  ggplot(aes(x = period, y = share, fill = content_type)) +
+  geom_col(width = 0.72) +
+  scale_y_continuous(labels = scales::percent_format(), expand = c(0, 0)) +
+  scale_fill_manual(values = c("Shows" = "#174a67",
+                               "Movies" = "#e1a046",
+                               "Unclassified" = "#aeb6bd")) +
+  labs(x = "Reporting period", y = "Share of hours viewed", fill = "Classification",
+       title = "Estimated viewing mix by half-year") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+**Takeaway:** Shows made up `r scales::percent(content_mix$Shows[content_mix$period == "2023H2"], accuracy = 0.1)` of watch hours in 2023H2 and `r scales::percent(content_mix$Shows[content_mix$period == "2026H1"], accuracy = 0.1)` in 2026H1. Movies made up `r scales::percent(content_mix$Movies[content_mix$period == "2023H2"], accuracy = 0.1)` in 2023H2 and `r scales::percent(content_mix$Movies[content_mix$period == "2026H1"], accuracy = 0.1)` in 2026H1. I have more confidence in those periods because the workbooks label shows and movies on separate worksheets. For 2023H1, I had to use titles and runtimes to estimate the format, and `r scales::percent(content_mix$Unclassified[content_mix$period == "2023H1"], accuracy = 0.1)` of watch hours remain unclassified. This shows that shows have generally taken a larger share of watch hours than movies.
+
+### Can Live Events Compete with Recorded Titles?
+
+```{r}
+live_comparison <- NETFLIX_DATA |>
+  summarise(hours_viewed = sum(hours_viewed), .by = c(period, title, live_event)) |>
+  summarise(
+    titles = n(),
+    average_hours = mean(hours_viewed),
+    top_tier_hours = unname(quantile(hours_viewed, 0.9)),
+    maximum_hours = max(hours_viewed),
+    .by = live_event
+  ) |>
+  mutate(content = if_else(live_event, "Live event", "Prerecorded")) |>
+  select(content, titles, average_hours, top_tier_hours, maximum_hours)
+
+live_comparison |>
+  gt::gt() |>
+  gt::tab_header(title = "Viewing per title-period, by live status",
+                 subtitle = "Top tier is the 90th percentile") |>
+  gt::cols_label(content = "Content", titles = "Title-periods",
+                 average_hours = "Average hours",
+                 top_tier_hours = "90th percentile hours",
+                 maximum_hours = "Maximum hours") |>
+  gt::fmt_number(columns = c(titles, average_hours, top_tier_hours,
+                             maximum_hours), decimals = 0)
+```
+
+**Takeaway:** In the imported data, live events averaged `r scales::comma(live_comparison$average_hours[live_comparison$content == "Live event"], accuracy = 1)` hours per title-period, compared with `r scales::comma(live_comparison$average_hours[live_comparison$content == "Prerecorded"], accuracy = 1)` for prerecorded content. At the 90th percentile, the figures were `r scales::comma(live_comparison$top_tier_hours[live_comparison$content == "Live event"], accuracy = 1)` and `r scales::comma(live_comparison$top_tier_hours[live_comparison$content == "Prerecorded"], accuracy = 1)` hours, respectively. I would not use this comparison alone to decide whether live events are worth paying for because it does not include costs, and the imported later-period data leaves out the movie worksheets here.
+
+## Figures for the Strategy Decision
+
+```{r}
+memo_evidence <- content_mix |>
+  filter(period %in% c("2023H2", "2026H1")) |>
+  summarise(
+    first_show_share = Shows[period == "2023H2"],
+    latest_show_share = Shows[period == "2026H1"],
+    change_percentage_points = 100 * (latest_show_share - first_show_share)
+  )
+memo_evidence
+```
+
+## Platform Strategy Memo (Task 7)
+
+**To:** Netflix Content Leadership<br>
+**Subject:** Priorities for the 2027 Original-Content Slate
+
+### The Recommendation
+
+Based on the viewing data, I would give streaming series an important place in Netflix's 2027 plans, while still keeping movies in the budget. I would also look for titles that people continue watching across several periods instead of relying only on one big opening.
+
+### Build Series for Repeat Viewing
+
+Shows received most of the watch hours in the workbooks where I could compare both formats. Their share increased from `r scales::percent(memo_evidence$first_show_share, accuracy = 0.1)` in 2023H2 to `r scales::percent(memo_evidence$latest_show_share, accuracy = 0.1)` in 2026H1, an increase of `r round(memo_evidence$change_percentage_points, 1)` percentage points. Movies still made up `r scales::percent(content_mix$Movies[content_mix$period == "2026H1"], accuracy = 0.1)` of the 2026H1 hours, so I would not remove them from the plan. I would put more emphasis on streaming series that can bring viewers back in later periods. The table of consistently watched titles gives one way to look for that pattern.
+
+### Pursue Reach while Keeping Regional Room
+
+Global availability is another factor I would consider. Globally available titles made up `r scales::percent(global_availability$title_share, accuracy = 0.1)` of distinct titles in the imported data but received `r scales::percent(global_availability$hours_share, accuracy = 0.1)` of its watch hours. It gives Netflix a reason to consider worldwide rights when planning a new series. At the same time, it does not mean every regional title is a poor investment.   There should be more information surrounding costs and local audiences before deciding how much of the budget should go to globally available content.
+
+### Test the Wider Slate before Scaling it
+
+I would also leave room for a variety of titles. The top ten individual titles accounted for only `r scales::percent(top_ten_2026_share, accuracy = 0.1)` of imported watch hours in 2026H1. That tells me the rest of the catalog matters too. Netflix could test different types of shows and then use later viewing periods to see which ones keep an audience before spending more on a franchise.
+
+### What the Data cannot Settle
+
+These recommendations are just starting points. The results in this report utilizes the imported data mainly covering shows in the later periods. Hours viewed also does not tell how much a title cost, how much money it earned, or how many different people watched it. Netflix would need additional information before making a final budget decision.
+
+::: {.callout-note title="AI Usage Statement" collapse="true"}
+
+ChatGPT/Codex helped write the R code, explain the assignment, brainstorm analysis ideas, and provide draft report text. I subsequently reviewed and revised the report writing before submission.
+
+:::
