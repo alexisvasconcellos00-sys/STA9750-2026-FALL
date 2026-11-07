@@ -1,5 +1,770 @@
 ---
-title: "Mini-Project Placeholder"
+title: "What Makes Public Transit Green?"
+subtitle: "Electricity, ridership, and the 2025 Green Transit Awards"
+author: "Alexis Vasconcellos"
+date: "2026-11-06"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show R code"
+    embed-resources: true
+    fig-width: 9
+    fig-height: 5.5
+    fig-dpi: 160
+    include-in-header:
+      text: |
+        <style>
+        :root { --bs-link-color: #087f8c; }
+        body { color: #243a43; }
+        .quarto-title-block .title { color: #183c47; }
+        h2 { margin-top: 2.2rem; color: #183c47; }
+        .subtitle { max-width: 48rem; }
+        .award-stat { padding: 1rem 1.25rem; margin: 1rem 0; background: #edf6f6; border-left: 4px solid #087f8c; }
+        .award-stat strong { color: #076c76; }
+        </style>
+execute:
+  warning: false
+  message: false
 ---
 
-This is a placeholder for STA9750 Mini-Project 2. Check back soon for more!
+## The question: efficient for whom, and over what distance?
+
+When I think about green public transit, electric trains and buses are usually the first things that come to mind. But electricity still has to be generated, and the amount of fuel an agency uses only tells part of the story. A large system may use more energy overall while moving each passenger with fewer emissions. I wanted to look at both sides: how much an agency uses and how much travel it provides in return.
+
+I use transit energy records, passenger travel and state electricity data to compare agencies in three ways. First, I look for the lowest estimated CO₂ per passenger-mile. Then I compare transit with a driving alternative to see where the largest potential emissions savings appear. Finally, I look at which electricity-only agency provides the most passenger travel. I walk through the data and the comparisons before announcing the three awards.
+
+## Building a comparable transit record
+
+The [National Transit Database](https://www.transit.dot.gov/ntd/data-product/2025-annual-database-energy-consumption) supplies 2025 energy and service records. The [EIA State Electricity Profiles](https://www.eia.gov/electricity/state/) supply 2024 grid emissions, retail prices and generation. The transit records describe agencies, transportation modes and service types; the electricity profiles describe states.
+
+The functions below download missing sources and reuse valid local files. For energy, the official DOT API provides a readable copy of the assigned release. It also preserves fuel descriptions that are useful when interpreting biodiesel blends and “Other Fuel.”
+
+```{r}
+#| label: load
+#| code-summary: "Load packages and set up local files"
+library(tidyverse)
+library(httr2)
+library(rvest)
+library(gt)
+
+cache_dir <- file.path("data", "mp02")
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+kg_per_lb <- 0.45359237
+number <- function(x, digits = 0) scales::number(x, accuracy = 10^-digits, big.mark = ",")
+percent <- function(x) scales::percent(x, accuracy = .1)
+word_list <- function(x) paste0(paste(head(x, -1), collapse = ", "), ", and ", tail(x, 1))
+add_complete <- function(x) if (anyNA(x)) NA_real_ else sum(x)
+ntd_id <- function(x) str_pad(str_trim(as.character(x)), 5, pad = "0")
+
+```
+
+```{r}
+#| label: download-helpers
+#| code-summary: "Source download and validation helpers"
+# Validate a response before it replaces a cached source.
+cached_download <- function(path, req, valid) {
+  if (file.exists(path) && isTRUE(tryCatch(valid(path), error = function(e) FALSE))) return(invisible(path))
+  tmp <- tempfile(tmpdir = dirname(path))
+  on.exit(unlink(tmp), add = TRUE)
+  req |> req_retry(max_tries = 3) |> req_perform(tmp)
+  stopifnot(valid(tmp), file.copy(tmp, path, overwrite = TRUE))
+  invisible(path)
+}
+
+read_state_profile <- function(path, state_name, state_code) {
+  page <- read_html(path)
+  caption <- page |> html_element("table caption") |> html_text2()
+  stopifnot(str_detect(caption, "2024"))
+  tab <- page |> html_element("table") |> html_table() |>
+    mutate(Item = str_to_lower(Item))
+  rank_name <- intersect(c("Rank", "U.S. rank"), names(tab))
+  value <- function(item) {
+    x <- tab |> filter(Item == item) |> pull(Value) |> parse_number()
+    stopifnot(length(x) == 1L, is.finite(x), x > 0)
+    x
+  }
+  tibble(state = state_name, state_code,
+    co2_lb_mwh = value("carbon dioxide (lbs/mwh)"),
+    price_mwh = 10 * value("average retail price (cents/kwh)"),
+    generation_mwh = value("net generation (megawatthours)"),
+    primary_source = tab |> filter(Item == "primary energy source") |> pull(all_of(rank_name)))
+}
+
+electricity <- map2_dfr(state.name, state.abb, function(st, ab) {
+  slug <- str_remove_all(str_to_lower(st), "\\s")
+  path <- file.path(cache_dir, slug)
+  cached_download(path, request(paste0("https://www.eia.gov/electricity/state/", slug, "/")),
+                  function(p) nrow(read_state_profile(p, st, ab)) == 1L)
+  read_state_profile(path, st, ab)
+})
+stopifnot(nrow(electricity) == 50L, !anyDuplicated(electricity$state_code))
+
+energy_file <- file.path(cache_dir, "2025_ntd_energy_api.csv")
+valid_energy <- function(p) {
+  x <- read_csv(p, col_types = cols(.default = col_character()), show_col_types = FALSE)
+  all(c("ntd_id", "agency_name", "mode", "tos", "gallons_of_other_fuel") %in% names(x)) &&
+    nrow(x) > 0 && nrow(x) < 50000
+}
+cached_download(energy_file, request("https://data.transportation.gov/resource/f432-ajba.csv") |>
+  req_url_query(`$limit` = 50000), valid_energy)
+energy_input <- read_csv(energy_file, col_types = cols(.default = col_character()),
+                         show_col_types = FALSE) |>
+  mutate(id = ntd_id(ntd_id), mode = str_trim(mode))
+
+service_file <- file.path(cache_dir, "2025_ntd_service.csv")
+service_query <- paste0("SELECT _5_digit_ntd_id AS NTD_ID, max_agency AS AGENCY, ",
+  "max_state AS state, max_city AS city, mode, type_of_service, ",
+  "questionable_record AS flagged_likely_inaccurate, ",
+  "sum_unlinked_passenger_trips_upt AS total_upt, sum_passenger_miles ",
+  "WHERE report_year = '2025' LIMIT 50000")
+valid_service <- function(p) {
+  x <- read_csv(p, show_col_types = FALSE)
+  all(c("NTD_ID", "mode", "total_upt", "sum_passenger_miles") %in% names(x)) &&
+    nrow(x) > 0 && nrow(x) < 50000
+}
+cached_download(service_file, request("https://data.transportation.gov/resource/4fir-qbim.csv") |>
+  req_url_query(`$query` = service_query), valid_service)
+service_input <- read_csv(service_file, col_types = cols(NTD_ID = col_character()),
+                          show_col_types = FALSE) |>
+  transmute(id = ntd_id(NTD_ID), agency = AGENCY, state_code = str_trim(state),
+    city, mode = str_trim(mode), service_type = type_of_service,
+    boardings = total_upt, passenger_miles = sum_passenger_miles,
+    flagged = !is.na(flagged_likely_inaccurate))
+
+```
+
+```{r}
+#| label: source-summary
+#| code-summary: "Show the three source files"
+source_summary <- tibble(Source = c("EIA State Electricity Profiles", "NTD Service by Agency", "NTD Energy Consumption"),
+  Year = c(2024, 2025, 2025), Records = c(nrow(electricity), nrow(service_input), nrow(energy_input)))
+source_summary |> gt() |> fmt_number(Records, decimals = 0)
+```
+
+The transit files contain `r number(nrow(energy_input))` energy records and `r number(nrow(service_input))` service records. One thing I had to keep in mind is that the electricity profiles cover 2024, while the transit records cover 2025. I use those profiles to estimate the emissions associated with an agency's electricity use. They give me a consistent basis for comparison, but they cannot tell me exactly where each agency bought its power in 2025.
+
+**Findings:** The service data cover more activity than the energy file can support on its own. Of the `r number(nrow(service_input))` service records, **`r number(sum(is.na(service_input$passenger_miles)))` lack passenger-miles**, and **`r number(sum(service_input$flagged))` are source-flagged**. These are important gaps because passenger-miles are the denominator for the Greenest award. A reported boarding count does not give me the missing trip distances, so I cannot calculate a reliable per-mile rate for every agency in the service file.
+
+Before joining, agency IDs are formatted consistently as five-digit strings, and transportation modes receive readable names. Service-type records are combined within each agency–mode pair. An unlinked passenger trip is a boarding; a transfer can create another boarding. Passenger-miles measure the combined distance traveled by all passengers.
+
+```{r}
+#| label: prepare
+#| code-summary: "Check agency identifiers and name transit modes"
+mode_names <- tribble(~mode, ~mode_name,
+  "AG", "Automated Guideway", "AR", "Alaska Railroad", "CB", "Commuter Bus",
+  "CC", "Cable Car", "CR", "Commuter Rail", "DR", "Demand Response",
+  "DT", "Demand Response Taxi", "FB", "Ferryboat", "HR", "Heavy Rail",
+  "IP", "Inclined Plane", "JT", "Jitney", "LR", "Light Rail", "MB", "Bus",
+  "MG", "Monorail / Automated Guideway", "PB", "Publico", "RB", "Bus Rapid Transit",
+  "SR", "Streetcar Rail", "TB", "Trolleybus", "TR", "Aerial Tramway", "VP", "Vanpool", "YR", "Hybrid Rail")
+stopifnot(all(union(energy_input$mode, service_input$mode) %in% mode_names$mode),
+          !anyDuplicated(service_input[c("id", "mode", "service_type")]),
+          !anyDuplicated(energy_input[c("id", "mode", "tos")]))
+state_conflicts <- service_input |> group_by(id, mode) |>
+  summarise(states = n_distinct(state_code, na.rm = FALSE), .groups = "drop") |>
+  filter(states != 1L)
+stopifnot(nrow(state_conflicts) == 0L)
+
+```
+
+```{r}
+#| label: prepare-service
+#| code-summary: "Combine service records and clean energy quantities"
+service_modes <- service_input |> group_by(id, mode) |>
+  summarise(agency = first(agency), state_code = first(state_code),
+    boardings = add_complete(boardings), passenger_miles = add_complete(passenger_miles),
+    flagged = any(flagged), .groups = "drop")
+
+fuel_fields <- names(energy_input)[str_detect(names(energy_input), "^gallons_of_|^kilowatt_hours_of_")]
+blank_fuel <- function(x) is.na(x) | str_trim(x) %in% c("", "-")
+read_fuel <- function(x) {
+  value <- suppressWarnings(as.numeric(str_remove_all(x, ",")))
+  value[blank_fuel(x)] <- 0
+  value
+}
+energy_rows <- energy_input |>
+  mutate(entirely_blank = if_all(all_of(fuel_fields), blank_fuel)) |>
+  mutate(across(all_of(fuel_fields), read_fuel)) |>
+  mutate(bad_number = if_any(all_of(fuel_fields), ~is.na(.x) | .x < 0)) |>
+  left_join(mode_names, by = "mode", relationship = "many-to-one")
+service_modes <- service_modes |>
+  left_join(mode_names, by = "mode", relationship = "many-to-one")
+
+```
+
+```{r}
+#| label: display-settings
+#| code-summary: "Chart and table formatting"
+palette <- c("#087F8C", "#365275", "#B87523")
+theme_set(theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", color = "#183C47"),
+        plot.caption = element_text(hjust = 0, size = 9),
+        panel.grid.minor = element_blank(), legend.position = "bottom"))
+format_table <- function(x, title = NULL) {
+  x |> gt() |> tab_header(title = title) |>
+    tab_options(table.font.size = px(13), heading.align = "left",
+                column_labels.font.weight = "bold")
+}
+```
+
+Combining service types leaves `r number(nrow(service_modes))` agency–mode service records. This gives the service and energy tables a common level of detail and avoids attaching the same fuel total to several service-type rows.
+
+## Electricity changes the meaning of an electric ride
+
+### Where electricity is most expensive
+
+Hawaii has the highest average retail electricity price, followed by California, Connecticut, Rhode Island and Massachusetts. What stands out to me is that the cost of using electricity can vary considerably from state to state. These prices help explain the setting in which agencies operate, although they are state averages and may differ from an agency's actual bill. I keep price separate from the emissions calculation because expensive electricity does not automatically mean higher CO₂.
+
+```{r}
+#| label: eia-prices
+#| fig-alt: "The five highest state retail electricity prices in 2024, expressed in dollars per megawatt-hour."
+expensive_states <- electricity |> slice_max(price_mwh, n = 5, with_ties = FALSE)
+ggplot(expensive_states, aes(price_mwh, reorder(state, price_mwh))) +
+  geom_col(fill = palette[1], width = .65) +
+  geom_text(aes(label = scales::dollar(price_mwh, accuracy = .1)), hjust = -.12, size = 3.5) +
+  scale_x_continuous(labels = scales::label_dollar(), expand = expansion(mult = c(0, .16))) +
+  labs(title = "Hawaii has the highest retail electricity price", x = "Average retail price ($/MWh)", y = NULL,
+       caption = "Source: EIA State Electricity Profiles, 2024. State averages, not agency electricity bills.")
+```
+
+**Findings:** Hawaii averages **$`r number(expensive_states$price_mwh[1], 1)` per MWh**, compared with **$`r number(expensive_states$price_mwh[2], 1)`** in California. That puts Hawaii **`r percent(expensive_states$price_mwh[1] / expensive_states$price_mwh[2] - 1)` above** the next most expensive state. Connecticut, Rhode Island and Massachusetts are much closer together, ranging from **$`r number(min(expensive_states$price_mwh), 1)` to $`r number(expensive_states$price_mwh[3], 1)` per MWh**. The largest separation in this top-five group is between Hawaii and the rest. For agencies considering electric service, this is a reminder that the same electricity requirement can have a very different cost depending on location.
+
+### Where electricity has the highest carbon intensity
+
+The five states below produce the most CO₂ for each MWh of electricity generated. Four have coal as their primary generation source, while Hawaii mainly uses petroleum. This helps explain why I would be careful about calling a transit system green just because it runs on electricity. The vehicle may have no tailpipe emissions, but the power used to run it still contributes to the total.
+
+```{r}
+#| label: eia-dirty
+dirty_states <- electricity |> slice_max(co2_lb_mwh, n = 5, with_ties = FALSE)
+dirty_states |> select(state, primary_source, co2_lb_mwh) |>
+  format_table("Highest electricity CO2 intensity") |>
+  cols_label(state = "State", primary_source = "Primary generation source", co2_lb_mwh = "lb CO2/MWh") |>
+  fmt_number(co2_lb_mwh, decimals = 0)
+```
+
+**Findings:** West Virginia has the highest electricity emissions intensity at **`r number(dirty_states$co2_lb_mwh[1])` lb CO₂/MWh**, followed by Kentucky (**`r number(dirty_states$co2_lb_mwh[2])`**), Wyoming (**`r number(dirty_states$co2_lb_mwh[3])`**), Missouri (**`r number(dirty_states$co2_lb_mwh[4])`**) and Hawaii (**`r number(dirty_states$co2_lb_mwh[5])`**). West Virginia’s rate is **`r percent(dirty_states$co2_lb_mwh[1] / dirty_states$co2_lb_mwh[5] - 1)` higher than Hawaii’s**, even though Hawaii has the highest price. This is a clear example of why I treat electricity cost and electricity emissions as separate questions.
+
+```{r}
+#| label: eia-inline
+us_grid <- weighted.mean(electricity$co2_lb_mwh, electricity$generation_mwh)
+ny_grid <- electricity |> filter(state_code == "NY") |> pull(co2_lb_mwh)
+tx_grid <- electricity |> filter(state_code == "TX") |> pull(co2_lb_mwh)
+rare_sources <- electricity |> count(primary_source, name = "states") |>
+  slice_min(states, n = 3, with_ties = TRUE)
+```
+
+### The national benchmark and the New York–Texas comparison
+
+Across the 50 states, the generation-weighted average is **`r number(us_grid, 1)` lb CO₂ per MWh**. Weighting by generation gives greater influence to states that produce more electricity; an unweighted mean would instead describe the average state.
+
+New York's intensity is **`r number(ny_grid)` lb/MWh**, compared with **`r number(tx_grid)` lb/MWh** in Texas. Texas therefore emits **`r number(tx_grid / ny_grid, 2)` times as much CO₂ per MWh**, or equivalently New York's rate is **`r percent(1 - ny_grid / tx_grid)` lower**. Under the model used here, the same electricity use results in a lower emissions estimate in New York. This compares electricity production intensity, not the two states' total emissions.
+
+**Findings:** New York is **`r percent(1 - ny_grid / us_grid)` below** the generation-weighted national benchmark, while Texas is **`r percent(tx_grid / us_grid - 1)` above** it. To make the difference more concrete, using **one million kWh** would produce an estimated **`r number(ny_grid * kg_per_lb)` metric tons of CO₂ in New York**, compared with **`r number(tx_grid * kg_per_lb)` metric tons in Texas**. That is about **`r number((tx_grid - ny_grid) * kg_per_lb)` additional metric tons** for the same electricity use. The grid factor therefore changes the estimated emissions even before ridership enters the comparison.
+
+### Which primary generation sources are least common?
+
+Petroleum leads generation only in Hawaii. Hydroelectric power and wind tie as the next least common primary sources, each leading in four states. The table identifies those states and their retail prices. A primary source is the largest contributor to a state's generation, not its only source.
+
+```{r}
+#| label: eia-rare
+electricity |> inner_join(rare_sources, by = "primary_source", relationship = "many-to-one") |>
+  arrange(states, primary_source, state) |> select(primary_source, states, state, price_mwh) |>
+  format_table("The least common primary generation sources") |>
+  cols_label(primary_source = "Primary source", states = "Number of states", state = "State", price_mwh = "Retail $/MWh") |>
+  fmt_currency(price_mwh, decimals = 2)
+```
+
+**Findings:** Only **nine of the 50 states** fall into these three least-common primary-source categories: one petroleum state, four hydroelectric states and four wind states. The hydroelectric group consists of **`r word_list(electricity$state[electricity$primary_source == "Hydroelectric"])`**, while the wind group consists of **`r word_list(electricity$state[electricity$primary_source == "Wind"])`**. Across the hydroelectric group, prices range from **$`r number(min(electricity$price_mwh[electricity$primary_source == "Hydroelectric"]), 1)` to $`r number(max(electricity$price_mwh[electricity$primary_source == "Hydroelectric"]), 1)` per MWh**; the wind group ranges from **$`r number(min(electricity$price_mwh[electricity$primary_source == "Wind"]), 1)` to $`r number(max(electricity$price_mwh[electricity$primary_source == "Wind"]), 1)`**. “Least common” here describes how often a source ranks first in a state, rather than how little electricity that source generates nationally.
+
+**My takeaway:** A state's main energy source helps describe its electricity system, but that label does not explain everything about its prices or emissions. States in the same category can still have different prices and generation mixes. For the transit comparison, I use the actual state CO₂ rate so that the calculation reflects those differences more closely.
+
+## What transit agencies consume
+
+### The five largest reported fuel users
+
+The following table combines each agency's reported fuel use across its modes. It includes Other Fuel rather than discarding it. CNG is reported in gallon equivalents, so the total is a descriptive measure of reported gallons/equivalents, not a common energy-content unit.
+
+```{r}
+#| label: energy-eda
+#| code-summary: "Prepare fuel labels and national totals"
+fuel_labels <- tribble(~fuel, ~label, ~unit,
+  "gallons_of_bio_diesel", "Biodiesel blends", "Gallons / equivalents",
+  "gallons_of_bunker_fuel", "Bunker fuel", "Gallons / equivalents",
+  "gallons_of_compressed_natural", "Compressed natural gas", "Gallons / equivalents",
+  "gallons_of_diesel_fuel", "Diesel", "Gallons / equivalents",
+  "kilowatt_hours_of_electric", "Battery electricity", "kWh",
+  "kilowatt_hours_of_electric_1", "Propulsion electricity", "kWh",
+  "gallons_of_ethanol", "Ethanol", "Gallons / equivalents",
+  "gallons_of_gasoline", "Gasoline", "Gallons / equivalents",
+  "gallons_of_hydrogen", "Hydrogen (source unit unresolved)", "Unresolved",
+  "gallons_of_kerosene", "Kerosene", "Gallons / equivalents",
+  "gallons_of_liquified_natural", "Liquefied natural gas", "Gallons / equivalents",
+  "gallons_of_liquified_petroleum", "Liquefied petroleum gas", "Gallons / equivalents",
+  "gallons_of_other_fuel", "Other fuel", "Gallons / equivalents")
+stopifnot(setequal(fuel_fields, fuel_labels$fuel))
+energy_long <- energy_rows |>
+  pivot_longer(all_of(fuel_fields), names_to = "fuel", values_to = "quantity") |>
+  left_join(fuel_labels, by = "fuel", relationship = "many-to-one")
+fuel_totals <- energy_long |> group_by(fuel, label, unit) |>
+  summarise(quantity = sum(quantity, na.rm = TRUE), .groups = "drop")
+```
+
+```{r}
+#| label: fuel-summaries
+#| code-summary: "Summarize fuel use by agency"
+# Count users from the original rows, independently of the total quantity.
+fuel_users <- energy_long |> filter(!is.na(quantity), quantity > 0) |>
+  distinct(id, fuel) |> count(fuel, name = "agencies_using")
+fuel_totals <- fuel_totals |>
+  left_join(fuel_users, by = "fuel", relationship = "one-to-one") |>
+  mutate(agencies_using = replace_na(agencies_using, 0L))
+liquid_long <- energy_long |> filter(unit == "Gallons / equivalents")
+agency_fuel <- liquid_long |> group_by(id, agency_name) |>
+  summarise(total = sum(quantity), .groups = "drop") |>
+  slice_max(total, n = 5, with_ties = FALSE)
+fuel_breakdown <- liquid_long |> semi_join(agency_fuel, by = "id") |>
+  mutate(category = case_when(label %in% c("Diesel", "Gasoline", "Compressed natural gas", "Biodiesel blends") ~ label,
+                              TRUE ~ "Other reported fuels")) |>
+  group_by(id, agency_name, category) |> summarise(gallons = sum(quantity), .groups = "drop") |>
+  pivot_wider(names_from = category, values_from = gallons, values_fill = 0) |>
+  left_join(agency_fuel |> select(id, total), by = "id", relationship = "one-to-one") |>
+  arrange(desc(total))
+```
+
+```{r}
+#| label: fuel-table
+#| code-summary: "Show the five largest fuel users"
+fuel_breakdown |> select(-id) |> format_table("Largest reported fuel users — millions of gallons/equivalents") |>
+  cols_label(agency_name = "Agency", total = "Total") |>
+  fmt_number(where(is.numeric), decimals = 2, scale_by = 1e-6)
+least_used <- fuel_totals |> filter(agencies_using > 0) |>
+  slice_min(agencies_using, n = 1, with_ties = TRUE)
+unused <- fuel_totals |> filter(agencies_using == 0)
+```
+
+`r agency_fuel$agency_name[1]` reports the largest total at **`r number(agency_fuel$total[1] / 1e6, 1)` million gallons/equivalents**. I would not use that total alone to call it the least environmentally friendly agency. An agency serving more riders or covering longer distances will generally need more energy. This table tells me where fuel use is concentrated; the later comparison asks how much passenger travel those agencies provide for their emissions.
+
+**Findings:** The five largest reported fuel users are **New Jersey Transit, MTA New York City Transit, Los Angeles County Metropolitan Transportation Authority, Northeast Illinois Regional Commuter Railroad Corporation and Massachusetts Bay Transportation Authority**, in that order. New Jersey Transit reports **`r number(agency_fuel$total[1] / 1e6, 1)` million gallons/equivalents**, and NYC Transit follows with **`r number(agency_fuel$total[2] / 1e6, 1)` million**. Their totals are close: New Jersey Transit is only **`r percent(agency_fuel$total[1] / agency_fuel$total[2] - 1)` higher**. The fuel mixes are more different. Diesel accounts for **`r percent(fuel_breakdown$Diesel[1] / fuel_breakdown$total[1])`** of New Jersey Transit’s total and **`r percent(fuel_breakdown$Diesel[2] / fuel_breakdown$total[2])`** of NYC Transit’s. LA Metro instead gets **`r percent(fuel_breakdown[["Compressed natural gas"]][3] / fuel_breakdown$total[3])`** of its reported total from CNG. This means similar positions in the fuel-use ranking can represent quite different operations.
+
+### Fuel and electricity use across the country
+
+Diesel accounts for the largest reported fuel total, while propulsion electricity makes up most of the electricity use. To me, this shows that conventional fuel remains a major part of transit operations even with electric service in the picture. I show the two groups separately because gallons and kWh measure different things. The bars are useful for comparing fuels within each panel, but I would need to convert them to emissions before comparing the two panels.
+
+```{r}
+#| label: fuel-plot
+#| fig-height: 7
+#| fig-alt: "Transit fuel totals and electricity totals in separate panels, with different unit scales."
+fuel_plot <- fuel_totals |> filter(unit != "Unresolved", quantity > 0) |>
+  mutate(unit = factor(unit, levels = c("Gallons / equivalents", "kWh")),
+         label = forcats::fct_reorder(label, quantity)) |>
+  ggplot(aes(quantity / 1e6, label)) +
+  geom_col(fill = palette[1], width = .65) +
+  facet_wrap(~unit, scales = "free", ncol = 1) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  labs(title = "Two energy systems: combustion and electricity",
+    x = "Million reported units — compare within each panel", y = NULL,
+    caption = "Source: FTA NTD 2025 Energy Consumption. Gas gallon equivalents are not physical liquid volumes.\nHydrogen is excluded because its API unit differs from the assignment workbook. Zero-use fuels are omitted.")
+fuel_plot
+```
+
+**Findings:** Agencies report **`r number(fuel_totals$quantity[fuel_totals$label == "Diesel"] / 1e6, 1)` million gallons of diesel**, compared with **`r number(fuel_totals$quantity[fuel_totals$label == "Compressed natural gas"] / 1e6, 1)` million CNG gallon equivalents** and **`r number(fuel_totals$quantity[fuel_totals$label == "Gasoline"] / 1e6, 1)` million gallons of gasoline**. The reported diesel total is about **`r number(fuel_totals$quantity[fuel_totals$label == "Diesel"] / fuel_totals$quantity[fuel_totals$label == "Compressed natural gas"], 1)` times** the CNG total. Gasoline, however, appears at **`r fuel_totals$agencies_using[fuel_totals$label == "Gasoline"]` agencies**, compared with **`r fuel_totals$agencies_using[fuel_totals$label == "Diesel"]` for diesel**. The fuel with the largest total is therefore not the fuel used by the most agencies.
+
+Electric propulsion totals **`r number(fuel_totals$quantity[fuel_totals$label == "Propulsion electricity"] / 1e9, 2)` billion kWh**, while battery electricity totals **`r number(fuel_totals$quantity[fuel_totals$label == "Battery electricity"] / 1e6, 1)` million kWh**. Propulsion makes up **`r percent(fuel_totals$quantity[fuel_totals$label == "Propulsion electricity"] / sum(fuel_totals$quantity[fuel_totals$unit == "kWh"]))`** of reported electricity use. Battery electricity is reported by more agencies, but its combined use is much smaller. I would keep both the number of users and the total quantity in view when describing how widespread each source is.
+
+### The least common fuel
+
+Among fuels with positive reported use, **`r least_used$label[1]`** is least common: it is reported by **`r least_used$agencies_using[1]` agency**, totaling **`r number(least_used$quantity[1])` reported units**. **`r paste(unused$label, collapse = " and ")`** have no positive use in this release. Counting agencies avoids directly comparing a gallon of fuel with a kWh of electricity.
+
+**My takeaway:** The most common fuel, the largest fuel user and the cleanest agency answer different questions. At this point, I can describe what agencies consume, but I still need to connect those quantities to passenger travel before deciding which systems perform well.
+
+## Connecting energy to passengers
+
+The join uses **agency ID and mode**, followed by the agency's state abbreviation to add its grid factor. Names are kept as labels rather than join keys because they can vary between tables. A full join preserves unmatched records for checking; incomplete agencies are excluded later rather than receiving zero emissions.
+
+```{r}
+#| label: join
+energy_modes <- energy_rows |> group_by(id, mode) |>
+  summarise(energy_agency = first(agency_name), energy_present = TRUE,
+            energy_uncertain = any(entirely_blank | bad_number), .groups = "drop")
+combined <- full_join(service_modes |> mutate(service_present = TRUE), energy_modes,
+                     by = c("id", "mode"), relationship = "one-to-one") |>
+  left_join(electricity |> select(state_code, co2_lb_mwh), by = "state_code", relationship = "many-to-one")
+join_summary <- tibble(Check = c("Energy modes matched to service", "Service modes without energy", "Service modes outside 50-state grid coverage"),
+  Records = c(sum(!is.na(combined$energy_present) & !is.na(combined$service_present)),
+              sum(is.na(combined$energy_present)),
+              sum(!is.na(combined$service_present) & is.na(combined$co2_lb_mwh))))
+stopifnot(!anyDuplicated(combined[c("id", "mode")]),
+          nrow(combined) == nrow(distinct(bind_rows(service_modes |> select(id, mode), energy_modes |> select(id, mode)))))
+join_summary |> format_table("What matched before emissions were calculated") |>
+  fmt_number(Records, decimals = 0)
+```
+
+All `r number(nrow(energy_modes))` agency–mode pairs in the energy data match service records. The gap appears in the other direction: `r number(sum(is.na(combined$energy_present)))` service pairs have no matching energy record. I cannot assume those services ran without consuming energy. I keep track of the missing matches and leave incomplete agencies out of the awards. Service outside the 50-state electricity coverage also cannot receive the same grid-based estimate. This means the final awards describe the agencies I can compare with the available data.
+
+## Turning fuel use into estimated CO₂
+
+For each agency–mode pair, the calculation is:
+
+$$
+E = \sum_f \left(\text{fuel quantity}_f \times \text{CO₂ factor}_f\right)
++ \frac{\text{electricity in kWh}}{1{,}000}
+\times \text{state lb CO₂/MWh} \times 0.45359237.
+$$
+
+The result is kilograms of CO₂. Conventional fuel factors come from [EIA](https://www.eia.gov/environment/emissions/co2_vol_mass.php); [EPA's 2025 factors](https://www.epa.gov/system/files/documents/2025-01/ghg-emission-factors-hub-2025.pdf) supply gasoline, LPG, LNG, biodiesel and ethanol values. The estimate covers fuel-combustion CO₂, including CO₂ from biogenic carbon, and electricity-generation CO₂. It does not estimate lifecycle emissions or the carbon previously absorbed by biofuel feedstocks.
+
+CNG needs a unit assumption. The [NTD reporting manual](https://www.transit.dot.gov/sites/fta.dot.gov/files/2025-08/2025-NTD-Full-Policy-Manual.pdf) allows gasoline- or diesel-gallon equivalents. The baseline assumes diesel equivalents; the sensitivity check uses gasoline equivalents. Simple biodiesel labels such as B5 and B20 determine the blend fraction. For unclear biodiesel blends and Other Fuel described as diesel, I use the diesel emissions factor as a proxy. These quantities remain in the calculation rather than disappearing.
+
+Blank fuel entries follow the instructor's zero-fill convention, but an entirely blank energy row is not treated as proof of zero consumption. Negative or malformed quantities are flagged. Agencies with unresolved hydrogen use or an unrecognized positive fuel description do not receive a complete estimate.
+
+```{r}
+#| label: model
+#| code-summary: "Convert reported energy into estimated CO₂"
+# Conventional fuel factors: EIA; supplemental fuels: EPA's 2025 factors.
+# All calculations use kilograms. Combustion CO2 includes biogenic carbon.
+# CNG baseline: diesel-gallon equivalents; alternate scenario: gasoline equivalents.
+cng_dge <- 52.91 * .138
+cng_gge <- 52.91 * .114
+
+# Use exact blend percentages when stated unambiguously. Mixed/unknown blends use a diesel proxy.
+blend_text <- str_to_lower(str_squish(energy_long$bio_diesel_description))
+simple_blend <- case_when(
+  str_detect(blend_text, "^b[- ]?[0-9]{1,3}$") ~ as.numeric(str_extract(blend_text, "[0-9]+")) / 100,
+  str_detect(blend_text, "^[0-9]{1,3}%$") ~ as.numeric(str_extract(blend_text, "[0-9]+")) / 100,
+  TRUE ~ NA_real_)
+stopifnot(all(simple_blend[!is.na(simple_blend)] >= 0 & simple_blend[!is.na(simple_blend)] <= 1))
+
+fuel_model <- energy_long |> mutate(
+  biodiesel_fraction = simple_blend,
+  electric = unit == "kWh",
+  other_diesel = str_detect(coalesce(other_fuel_description, ""), regex("diesel|^R-?99$", ignore_case = TRUE)),
+  factor_kg = case_when(
+    fuel == "gallons_of_diesel_fuel" ~ 10.19,
+    fuel == "gallons_of_gasoline" ~ 8.78,
+    fuel == "gallons_of_bunker_fuel" ~ 11.24,
+    fuel == "gallons_of_kerosene" ~ 9.88,
+    fuel == "gallons_of_liquified_petroleum" ~ 5.68,
+    fuel == "gallons_of_liquified_natural" ~ 4.50,
+    fuel == "gallons_of_compressed_natural" ~ cng_dge,
+    fuel == "gallons_of_bio_diesel" ~ coalesce((1 - biodiesel_fraction) * 10.19 + biodiesel_fraction * 9.45, 10.19),
+    fuel == "gallons_of_ethanol" ~ 5.75,
+    fuel == "gallons_of_other_fuel" & other_diesel ~ 10.19,
+    TRUE ~ NA_real_),
+  alternate_factor = case_when(
+    fuel == "gallons_of_compressed_natural" ~ cng_gge,
+    fuel == "gallons_of_bio_diesel" ~ 9.45,
+    fuel == "gallons_of_other_fuel" & other_diesel ~ 10.19 * .9,
+    TRUE ~ factor_kg)) |>
+  left_join(combined |> select(id, mode, co2_lb_mwh), by = c("id", "mode"), relationship = "many-to-one") |>
+  mutate(co2_kg = case_when(
+    is.na(quantity) | quantity < 0 ~ NA_real_,
+    quantity == 0 ~ 0,
+    electric ~ quantity / 1000 * co2_lb_mwh * kg_per_lb,
+    TRUE ~ quantity * factor_kg),
+    alternate_kg = case_when(
+      is.na(quantity) | quantity < 0 ~ NA_real_,
+      quantity == 0 ~ 0,
+      electric ~ quantity / 1000 * co2_lb_mwh * kg_per_lb,
+      TRUE ~ quantity * alternate_factor))
+```
+
+```{r}
+#| label: agency-model
+#| code-summary: "Combine emissions and check agency eligibility"
+mode_co2 <- fuel_model |> group_by(id, mode) |>
+  summarise(emissions_kg = add_complete(co2_kg), alternate_kg = add_complete(alternate_kg),
+    electric_kg = add_complete(co2_kg[electric]),
+    only_electric = all(electric | quantity == 0) & any(electric & quantity > 0),
+    has_positive_energy = any(quantity > 0, na.rm = TRUE),
+    uses_other = any(fuel == "gallons_of_other_fuel" & quantity > 0, na.rm = TRUE),
+    .groups = "drop")
+mode_results <- combined |> left_join(mode_co2, by = c("id", "mode"), relationship = "one-to-one") |>
+  mutate(mode_complete = !is.na(service_present) & !is.na(energy_present) &
+    !is.na(flagged) & !flagged & !is.na(energy_uncertain) & !energy_uncertain &
+    !is.na(has_positive_energy) & has_positive_energy &
+    is.finite(emissions_kg) & boardings > 0 & passenger_miles > 0 & state_code %in% state.abb)
+# Preserve unknown modes and denominators when forming whole-agency totals.
+agencies <- mode_results |> group_by(id) |>
+  summarise(agency = first(coalesce(agency, energy_agency)[!is.na(coalesce(agency, energy_agency))]),
+    boardings = add_complete(boardings), passenger_miles = add_complete(passenger_miles),
+    emissions_kg = add_complete(emissions_kg), alternate_kg = add_complete(alternate_kg),
+    electric_kg = add_complete(electric_kg),
+    complete = all(replace_na(mode_complete, FALSE)),
+    electricity_only = all(replace_na(only_electric, FALSE)),
+    uses_other = any(replace_na(uses_other, FALSE)),
+    modes = paste(sort(unique(mode)), collapse = ", "), .groups = "drop") |>
+  mutate(kg_per_boarding = emissions_kg / boardings,
+         kg_per_mile = emissions_kg / passenger_miles)
+MIN_BOARDINGS <- 1000000
+MIN_MILES <- 1000000
+candidates <- agencies |> filter(complete, boardings >= MIN_BOARDINGS, passenger_miles >= MIN_MILES,
+                                is.finite(kg_per_mile), emissions_kg > 0)
+stopifnot(nrow(candidates) > 0, !anyDuplicated(candidates$id),
+          all(candidates$electric_kg >= 0),
+          all(candidates$electric_kg <= candidates$emissions_kg + 1e-6))
+
+```
+
+```{r}
+#| label: model-checks
+#| code-summary: "Check fuel totals and comparison coverage"
+# Conservation: the fuel model must retain every original fuel quantity.
+for (field in fuel_fields) {
+  stopifnot(isTRUE(all.equal(sum(energy_rows[[field]], na.rm = TRUE),
+    sum(fuel_model$quantity[fuel_model$fuel == field], na.rm = TRUE))))
+}
+coverage <- tibble(Stage = c("Agency identities across both NTD sources", "Complete modeled agency records", "Award candidates after size minimums"),
+                  Agencies = c(nrow(agencies), sum(agencies$complete), nrow(candidates)))
+coverage |> format_table("The comparison pool") |> fmt_number(Agencies, decimals = 0)
+
+```
+
+```{r}
+#| label: factor-lookup
+#| code-summary: "Document the emission factors"
+factor_table <- tribble(~Fuel, ~`kg CO2 per reported unit`, ~Assumption,
+  "Diesel / bunker / kerosene", "10.19 / 11.24 / 9.88", "EIA; bunker uses residual fuel oil",
+  "Gasoline / LPG / LNG", "8.78 / 5.68 / 4.50", "EPA 2025 mobile-combustion factors",
+  "CNG", number(cng_dge, 3), "Diesel-gallon equivalent baseline; gasoline equivalent tested",
+  "Biodiesel blends", "9.45 to 10.19", "Known simple blend; diesel proxy if uncertain",
+  "Ethanol", "5.75", "EPA pure-ethanol factor; includes biogenic CO2",
+  "Other fuel described as diesel", "10.19", "Diesel proxy; sensitivity and exclusion checks",
+  "Electricity", "State factor × 0.45359237 / 1000", "EIA lb/MWh converted to kg/kWh")
+```
+
+The comparison pool contains **`r nrow(candidates)` agencies** with complete modeled records, no source-flagged service modes, at least **one million annual boardings** and **one million passenger-miles**. These thresholds are choices for this project. They reduce the influence of tiny denominators while keeping the award criteria easy to explain.
+
+**Findings:** The combined sources identify **`r number(nrow(agencies))` agencies**, but only **`r number(sum(agencies$complete))`** have complete modeled records. Applying the one-million-boarding and one-million-passenger-mile minimums leaves **`r nrow(candidates)` award candidates**—about **`r percent(nrow(candidates) / nrow(agencies))`** of the original agency identities. The largest reduction happens during the completeness checks, before I apply the size minimums. This matters when reading the awards: an agency can be absent because its records do not support the comparison, even if it provides substantial service.
+
+NYC Transit is outside this pool because its reported bus rapid transit (BRT) service is source-flagged. Its exclusion is a data-quality decision, not a finding that its entire network performs worse than the agencies that remain.
+
+::: {.callout-note title="Fuel assumptions" collapse="true"}
+
+```{r}
+#| label: fuel-assumptions-table
+factor_table |> format_table("Factors and assumptions used in the model")
+```
+
+The hydrogen unit label in the API differs from the label in the assignment workbook, so hydrogen users are excluded rather than assigned an unsupported production factor. The Other Fuel proxy estimates combustion CO₂ only; it does not establish the lifecycle impact of renewable diesel.
+:::
+
+## Comparing efficiency and impact
+
+I add up each agency's emissions and passenger service across its modes before calculating the two efficiency measures. That way, a small service does not receive the same weight as a much larger one just because both belong to the same agency. The table below shows the five eligible agencies with the lowest estimated emissions per passenger-mile, alongside their emissions per boarding.
+
+```{r}
+#| label: efficiency
+top_efficiency <- candidates |> slice_min(kg_per_mile, n = 5, with_ties = FALSE)
+boarding_leaders <- candidates |> slice_min(kg_per_boarding, n = 1, with_ties = TRUE)
+top_efficiency |> transmute(Agency = agency, `Annual boardings` = boardings,
+  `kg CO2/boarding` = kg_per_boarding, `kg CO2/passenger-mile` = kg_per_mile) |>
+  format_table("Five lowest-emission eligible agencies per passenger-mile") |>
+  fmt_number(`Annual boardings`, decimals = 0) |>
+  fmt_number(c(`kg CO2/boarding`, `kg CO2/passenger-mile`), decimals = 3)
+```
+
+**Findings:** Seattle Center Monorail ranks first at **`r number(top_efficiency$kg_per_mile[1], 3)` kg CO₂ per passenger-mile**. It is followed by **`r top_efficiency$agency[2]`** at **`r number(top_efficiency$kg_per_mile[2], 3)` kg**, **`r top_efficiency$agency[3]`** at **`r number(top_efficiency$kg_per_mile[3], 3)` kg**, **`r top_efficiency$agency[4]`** at **`r number(top_efficiency$kg_per_mile[4], 3)` kg**, and **`r top_efficiency$agency[5]`** at **`r number(top_efficiency$kg_per_mile[5], 3)` kg**. The monorail’s estimate is **`r percent(1 - top_efficiency$kg_per_mile[1] / top_efficiency$kg_per_mile[2])` lower than the second-place agency’s**. At the same time, these agencies provide different amounts and types of service, so a low per-mile rate does not by itself identify the largest total emissions savings.
+
+Seattle Center Monorail also has the lowest estimated emissions per boarding in the eligible pool, at **`r number(boarding_leaders$kg_per_boarding[1], 3)` kg CO₂**, compared with a median of **`r number(median(candidates$kg_per_boarding), 3)` kg**. The winner is the same for both measures here, but the next agencies differ: Portland Streetcar ranks second per boarding, while CalVans ranks second per passenger-mile. This makes the choice of denominator important even when it does not change the first-place agency.
+
+**My takeaway:** The measure I choose changes what I learn from the table. CO₂ per boarding tells me the estimated emissions associated with an average boarding, while CO₂ per passenger-mile also takes distance into account. A longer rail trip could produce more emissions per boarding and still perform well per mile. I use the per-mile measure for the Greenest award because I want to compare the amount of travel provided, rather than treating every boarding as the same length of trip.
+
+For the emissions-avoided comparison, every transit passenger-mile is replaced with one mile of single-occupant gasoline driving. The baseline uses **49 mpg**, the benchmark associated with NHTSA's [2022 model-year 2024–2026 announcement](https://www.nhtsa.gov/press-releases/usdot-announces-new-vehicle-fuel-economy-standards-model-year-2024-2026). This is an explicit scenario, not a claim about the current vehicle fleet or current regulatory requirements. Hypothetical driving CO₂ minus modeled transit CO₂ gives estimated emissions avoided.
+
+```{r}
+#| label: awards
+#| code-summary: "Calculate the three award winners"
+CAR_MPG <- 49
+CAR_KG_GALLON <- 8.78
+ranked <- candidates |> mutate(driving_kg = passenger_miles / CAR_MPG * CAR_KG_GALLON,
+  avoided_tonnes = (driving_kg - emissions_kg) / 1000)
+greenest <- ranked |> slice_min(kg_per_mile, n = 1, with_ties = TRUE)
+avoided_winner <- ranked |> slice_max(avoided_tonnes, n = 1, with_ties = TRUE)
+electric_candidates <- ranked |> filter(electricity_only)
+electric_winner <- electric_candidates |> slice_max(passenger_miles, n = 1, with_ties = TRUE)
+stopifnot(nrow(greenest) == 1L, nrow(avoided_winner) == 1L, nrow(electric_winner) == 1L)
+intensity_median <- median(ranked$kg_per_mile)
+avoidance_median <- median(ranked$avoided_tonnes)
+electric_median <- median(electric_candidates$passenger_miles)
+
+```
+
+```{r}
+#| label: scenario-checks
+#| code-summary: "Test alternative fuel and driving assumptions"
+# Compare alternatives before writing the award conclusions.
+sensitivity <- crossing(fuel_assumption = c("Baseline", "Alternative factors", "Exclude Other Fuel users"), mpg = c(49, 35)) |>
+  pmap_dfr(function(fuel_assumption, mpg) {
+    pool <- ranked
+    if (fuel_assumption == "Exclude Other Fuel users") pool <- pool |> filter(!uses_other)
+    pool <- pool |> mutate(test_emissions = if (fuel_assumption == "Alternative factors") alternate_kg else emissions_kg,
+                          test_intensity = test_emissions / passenger_miles,
+                          test_avoided = (passenger_miles / mpg * CAR_KG_GALLON - test_emissions) / 1000)
+    bind_rows(
+      pool |> slice_min(test_intensity, n = 1, with_ties = TRUE) |> transmute(Award = "Greenest", Winner = agency),
+      pool |> slice_max(test_avoided, n = 1, with_ties = TRUE) |> transmute(Award = "Emissions avoided", Winner = agency),
+      pool |> filter(electricity_only) |> slice_max(passenger_miles, n = 1, with_ties = TRUE) |> transmute(Award = "Electric passenger miles", Winner = agency)) |>
+      mutate(`Fuel assumption` = fuel_assumption, `Car MPG` = mpg, .before = 1)
+  })
+stable_winners <- sensitivity |> distinct(Award, Winner) |> count(Award) |> summarise(stable = all(n == 1L)) |> pull(stable)
+
+```
+
+```{r}
+#| label: save-results
+#| code-summary: "Save detailed results locally"
+results_dir <- file.path(cache_dir, "rebuild")
+dir.create(results_dir, showWarnings = FALSE)
+write_csv(agencies, file.path(results_dir, "agency-results.csv"))
+write_csv(ranked, file.path(results_dir, "award-candidates.csv"))
+write_csv(sensitivity, file.path(results_dir, "sensitivity.csv"))
+write_csv(electricity, file.path(results_dir, "electricity-profiles.csv"))
+write_csv(factor_table, file.path(results_dir, "factor-assumptions.csv"))
+write_csv(bind_rows(greenest |> mutate(award = "Greenest"), avoided_winner |> mutate(award = "Emissions avoided"),
+                    electric_winner |> mutate(award = "Electric passenger miles")), file.path(results_dir, "winners.csv"))
+```
+
+The sensitivity analysis changes CNG equivalents, biodiesel treatment and the Other Fuel proxy, then repeats the driving comparison at 35 mpg. It also repeats the awards after excluding all Other Fuel users. **`r if (stable_winners) "All three winners remain unchanged in the scenarios tested." else "Some winners change under the alternative assumptions; the scenario table identifies those changes."`** Stability under these assumptions is useful evidence, but it does not eliminate uncertainty in the source records.
+
+**Findings:** Each award is checked under **six combinations** of fuel treatment and driving efficiency. Seattle Center Monorail, LIRR and PATH each remain the winner in all six. The Greenest and electric passenger-mile awards do not depend on car mpg, so the relevant tests for those awards are the fuel assumptions and the removal of Other Fuel users. For LIRR, the result also holds when I replace the 49-mpg car with a 35-mpg car. A less efficient car produces more CO₂ for the same distance, increasing the modeled savings from transit. The checks support the winner choices within this set of assumptions; they do not mean the estimated emissions themselves stay identical.
+
+::: {.callout-note title="Scenario results" collapse="true"}
+```{r}
+#| label: sensitivity-table
+sensitivity |> group_by(Award) |>
+  summarise(`Winner unchanged` = if_else(n_distinct(Winner) == 1L, "Yes", "No"),
+            `Scenarios checked` = n_distinct(paste(`Fuel assumption`, `Car MPG`)),
+            Winner = paste(unique(Winner), collapse = "; "),
+            .groups = "drop") |>
+  format_table("Award stability across six scenarios")
+```
+:::
+
+## Green Transit Alliance: 2025 award announcements
+
+**FOR IMMEDIATE RELEASE — New York, November 6, 2026**
+
+The Green Transit Alliance recognizes three agencies for different contributions to lower-carbon passenger travel. Using 2025 federal transit records and 2024 state electricity profiles, the analysis compares **`r nrow(ranked)` eligible agencies**. The awards distinguish efficient travel, modeled emissions savings and the scale of electric service.
+
+### Greenest Transit Agency: Seattle Center Monorail
+
+<div class="award-stat">
+**`r number(greenest$kg_per_mile, 3)` kg CO₂ per passenger-mile** · **`r percent(1 - greenest$kg_per_mile / intensity_median)` below the eligible-agency median**
+</div>
+
+I would give the Greenest Transit Agency award to Seattle Center Monorail. Its estimated emissions are **`r number(greenest$kg_per_mile, 3)` kg per passenger-mile**, compared with **`r number(intensity_median, 3)` kg** for the median eligible agency. It also records **`r number(greenest$kg_per_boarding, 3)` kg per boarding**. The size of the gap is what stands out to me: within this comparison, the monorail provides passenger travel at a much lower estimated emissions rate than the middle agency.
+
+The monorail reports electric propulsion, and I apply Washington's state-average electricity emissions factor to that use. This connects the award back to the electricity analysis: the grid supplying an electric service matters to its estimated emissions. I would keep the conclusion specific to Seattle Center Monorail. Its record does not represent King County Metro, Sound Transit or every transit trip in Seattle.
+
+```{r}
+#| label: greenest-award-chart
+#| fig-height: 4.5
+#| fig-alt: "Seattle Center Monorail's modeled CO2 per passenger-mile compared with the median eligible agency."
+benchmark <- tibble(Reporter = factor(c("Seattle Center Monorail", "Eligible-agency median"),
+                                    levels = c("Eligible-agency median", "Seattle Center Monorail")),
+                    value = c(greenest$kg_per_mile, intensity_median))
+green_chart <- ggplot(benchmark, aes(value, Reporter, fill = Reporter)) +
+  geom_col(width = .55, show.legend = FALSE) +
+  geom_text(aes(label = number(value, 3)), hjust = -.15, size = 4) +
+  scale_fill_manual(values = c("Seattle Center Monorail" = palette[1], "Eligible-agency median" = "#CBD8DE")) +
+  scale_x_continuous(expand = expansion(mult = c(0, .22))) +
+  labs(title = "Seattle's monorail sets the efficiency benchmark",
+       subtitle = paste(nrow(ranked), "eligible agencies | Lower is better"),
+       x = "Estimated kg CO2 per passenger-mile", y = NULL,
+       caption = "Sources: FTA NTD 2025 Energy and Service; EIA State Electricity Profiles 2024.\nComparison is the median of agency ratios, not a national passenger-weighted rate.") +
+  theme(panel.grid.major.y = element_blank())
+green_chart
+```
+
+### Most Emissions Avoided: MTA Long Island Rail Road
+
+<div class="award-stat">
+**`r number(avoided_winner$avoided_tonnes)` metric tons of modeled CO₂ avoided** · **49-mpg, single-occupant driving scenario**
+</div>
+
+MTA Long Island Rail Road delivers the largest estimated emissions reduction in the eligible pool. Replacing its **`r number(avoided_winner$passenger_miles / 1e9, 2)` billion passenger-miles** with single-occupant driving at 49 mpg would produce approximately **`r number(avoided_winner$driving_kg / 1e6, 1)` million kg of CO₂**, compared with **`r number(avoided_winner$emissions_kg / 1e6, 1)` million kg** in its modeled transit operations. The difference is **`r number(avoided_winner$avoided_tonnes)` metric tons**, or **`r percent(1 - avoided_winner$emissions_kg / avoided_winner$driving_kg)` below the driving scenario**.
+
+For comparison, the median eligible agency has **`r number(avoidance_median)` metric tons** of estimated net emissions avoided under the same scenario. That negative result is something I would pay attention to: the middle agency has higher modeled emissions than this particular efficient-car alternative. LIRR's result is different because it combines a large amount of passenger travel with a lower emissions rate than the assumed car. I would describe its award as the largest potential savings in this scenario. The data do not show that all of its riders would otherwise drive alone.
+
+```{r}
+#| label: avoided-emissions-chart
+#| fig-height: 4.5
+#| fig-alt: "LIRR's estimated transit emissions and hypothetical single-occupant driving emissions under a 49-mpg scenario."
+lirr_comparison <- tibble(Scenario = factor(c("Modeled transit operations", "Single-occupant driving, 49 mpg"),
+  levels = c("Single-occupant driving, 49 mpg", "Modeled transit operations")),
+  tonnes = c(avoided_winner$emissions_kg, avoided_winner$driving_kg) / 1000)
+avoided_chart <- ggplot(lirr_comparison, aes(tonnes / 1000, Scenario, fill = Scenario)) +
+  geom_col(width = .55, show.legend = FALSE) +
+  geom_text(aes(label = paste0(number(tonnes / 1000, 1), "k")), hjust = -.12, size = 4) +
+  scale_fill_manual(values = c("Modeled transit operations" = palette[1], "Single-occupant driving, 49 mpg" = "#CBD8DE")) +
+  scale_x_continuous(expand = expansion(mult = c(0, .18))) +
+  labs(title = "LIRR's modeled emissions are lower than driving",
+       subtitle = paste(number(avoided_winner$avoided_tonnes), "metric tons lower in the 49-mpg scenario"),
+       x = "Thousand metric tons of CO2", y = NULL,
+       caption = "Sources: FTA NTD 2025; EIA 2024 electricity factors; EIA/EPA fuel coefficients.\nDriving assumes one person per vehicle and identical travel distance. Savings are modeled, not observed.") +
+  theme(panel.grid.major.y = element_blank())
+avoided_chart
+```
+
+### Electric Passenger-Mile Leader: PATH
+
+<div class="award-stat">
+**`r number(electric_winner$passenger_miles / 1e6, 1)` million passenger-miles** · **`r number(electric_winner$passenger_miles / electric_median, 1)` times the electricity-only pool median**
+</div>
+
+For my original award, I wanted to recognize an agency that provides a large amount of passenger travel using electricity throughout its reported operations. PATH leads this group with **`r number(electric_winner$passenger_miles / 1e6, 1)` million passenger-miles**. The median is **`r number(electric_median / 1e6, 1)` million** among the **`r nrow(electric_candidates)` qualifying electricity-only agencies**. This gives the award a different focus from the Greenest award: it recognizes how much passenger travel electric service provides.
+
+An agency qualifies only when every recorded mode reports positive electricity use and no positive non-electric fuel. This keeps mixed-fuel services from being labeled fully electric. Electricity-generation CO₂ remains part of the emissions model. PATH wins for the scale of passenger travel it delivers through reported electric operations, rather than for simply using the most kWh.
+
+```{r}
+#| label: electric-leader-chart
+#| fig-height: 5.5
+#| fig-alt: "The five largest eligible electricity-only agencies by passenger miles, with PATH highlighted and the pool median marked."
+electric_top <- electric_candidates |> slice_max(passenger_miles, n = 5, with_ties = FALSE) |>
+  mutate(name = case_when(id == electric_winner$id ~ "PATH", TRUE ~ str_remove(agency, ".*dba:\\s*")),
+         name = reorder(str_wrap(name, 36), passenger_miles), winner = id == electric_winner$id)
+electric_chart <- ggplot(electric_top, aes(passenger_miles / 1e6, name)) +
+  geom_col(aes(fill = winner), width = .6, show.legend = FALSE) +
+  geom_vline(xintercept = electric_median / 1e6, linetype = "dashed", color = palette[3]) +
+  geom_text(aes(label = number(passenger_miles / 1e6, 1)), hjust = -.15, size = 3.7) +
+  scale_fill_manual(values = c(`TRUE` = palette[1], `FALSE` = "#CBD8DE")) +
+  scale_x_continuous(expand = expansion(mult = c(0, .16))) +
+  labs(title = "PATH delivers the most electric passenger travel",
+    subtitle = "Dashed line: median passenger miles of the electricity-only pool",
+    x = "Annual passenger-miles (millions)", y = NULL,
+    caption = "Sources: FTA NTD 2025 Energy Consumption and Service by Agency.\nNo non-electric fuel reported across the agency's modes. Electricity generation still produces CO2.") +
+  theme(panel.grid.major.y = element_blank())
+electric_chart
+
+figure_dir <- file.path("..", "mini-project-02-review", "rebuilt-figures")
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+ggsave(file.path(figure_dir, "greenest.png"), green_chart, width = 10, height = 4.5, dpi = 160, bg = "white")
+ggsave(file.path(figure_dir, "emissions-avoided.png"), avoided_chart, width = 11, height = 4.5, dpi = 160, bg = "white")
+ggsave(file.path(figure_dir, "electric-leader.png"), electric_chart, width = 10, height = 5.5, dpi = 160, bg = "white")
+```
+
+**Findings:** PATH provides **`r number(electric_winner$passenger_miles / 1e6, 1)` million passenger-miles**, compared with **`r number(electric_top$passenger_miles[order(-electric_top$passenger_miles)][2] / 1e6, 1)` million** for the second-largest qualifying electricity-only agency. Its total is about **`r number(electric_winner$passenger_miles / sort(electric_candidates$passenger_miles, decreasing = TRUE)[2], 1)` times** the runner-up’s, and it accounts for **`r percent(electric_winner$passenger_miles / sum(electric_candidates$passenger_miles))`** of passenger-miles across all nine qualifying agencies. This is why PATH stands out for this award: it provides a large share of the electric passenger travel in the eligible group. Its modeled emissions per passenger-mile are still higher than Seattle Center Monorail’s, which helps explain why the two awards go to different agencies.
+
+### What the awards mean
+
+Based on these results, I would look at more than one measure when deciding what makes transit green. Seattle Center Monorail stands out for low estimated emissions per passenger-mile. LIRR stands out for the amount of emissions it could avoid compared with the driving scenario. PATH stands out for the amount of passenger travel it provides using electricity-only operations. Each award tells me something useful about an agency, and looking at them together gives me a fuller picture than fuel use alone.
+
+I would use these awards as a starting point for further comparison. They cover the agencies with records that passed the project's data checks, and the results still depend on state electricity averages, fuel assumptions and the driving alternative. The estimates also leave out vehicle manufacturing, infrastructure, fuel production and greenhouse gases other than CO₂. Before making a broader recommendation, I would want more information about actual electricity purchases, passenger loads and how riders would travel without the service. Those details would help show how closely these estimates reflect everyday operations.
+
+## Sources
+
+- [FTA: 2025 Energy Consumption release](https://www.transit.dot.gov/ntd/data-product/2025-annual-database-energy-consumption) and [official energy API](https://data.transportation.gov/resource/f432-ajba.csv?$limit=50000).
+- [FTA/DOT: Service by Mode](https://data.transportation.gov/Public-Transit/NTD-Annual-Data-View-Service-by-Mode-/4fir-qbim/about_data), filtered to 2025.
+- [EIA: State Electricity Profiles](https://www.eia.gov/electricity/state/), 2024.
+- [EIA: CO₂ coefficients](https://www.eia.gov/environment/emissions/co2_vol_mass.php).
+- [EPA: 2025 GHG Emission Factors Hub](https://www.epa.gov/system/files/documents/2025-01/ghg-emission-factors-hub-2025.pdf), Table 2.
+- [FTA: 2025 Reporting Policy Manual](https://www.transit.dot.gov/sites/fta.dot.gov/files/2025-08/2025-NTD-Full-Policy-Manual.pdf), energy reporting and CNG equivalents.
+- [NHTSA: 2022 announcement for model years 2024–2026](https://www.nhtsa.gov/press-releases/usdot-announces-new-vehicle-fuel-economy-standards-model-year-2024-2026), historical basis for the 49-mpg scenario.
+
+::: {.callout-note title="AI Usage Statement" collapse="true"}
+ChatGPT was used to help write the code in this project, but all non-code text was generated without the use of any Generative AI tools. Additionally, ChatGPT was used to provide additional background information on the topic and to brainstorm ideas for the final open-ended prompt.
+
+:::
